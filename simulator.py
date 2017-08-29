@@ -13,8 +13,13 @@
 # [2, 3, 4, 5, 6, ..., 10]             # an apartment full of devices and a router
 # [100, 101, 102, 103, ..., 499, 500]  # an apartment complex full of devices and routers
 import random
+import collections
 
 import pride.components.base
+import pride.functions.persistence as persistence
+
+NAME_RESOLUTION_REQUEST = 0x00
+NAME_RESOLVER = dict()
 
 def get_nodes_from_groups(groups):
     nodes = []
@@ -48,8 +53,10 @@ class Broadcast_Network_Simulator(pride.components.base.Base):
         network_size = 2
         simulator = cls.generate_random_network(node_types, group_types, network_size)        
         connecting_node = Protocol_Simulator(latency=.005, name="router")        
+        name_resolution_node = Name_Resolution_Service(name="Name Resolution Service")
         simulator.groups[0].add(connecting_node)
-        simulator.groups[1].add(connecting_node)
+        simulator.groups[0].add(name_resolution_node)
+        simulator.groups[1].add(connecting_node)        
         #simulator.groups[2].add(connecting_node)
         print "Name of routing node: {}".format(connecting_node)
         while True:
@@ -82,15 +89,13 @@ class Packet(object):
 class Broadcast_Node_Simulator(pride.components.base.Base):
     
     packet_type = Packet
-    packet_fields = {"sender_id" : "name", "timestamp" : "simulation_time",
-                     "message_counter" : "_counter", "time_to_live" : "_counter_size"}
-    
-    latency_categories = {"fast" : .025, "normal" : .1, "slow" : .75}
-    defaults = {"simulation_time" : 0.00, "latency" : 0.100, "_counter" : 0}
-    flags = {"name" : None, "_next_send_time" : 0.00, "_counter_size" : 255}
-    mutable_defaults = {"groups" : list, "outgoing_packets" : list}
-    verbosity = {"update_state" : "vvv"}
         
+    latency_categories = {"fast" : .025, "normal" : .1, "slow" : .75}
+    defaults = {"simulation_time" : 0.00, "latency" : 0.100}
+    flags = {"name" : None, "_next_send_time" : 0.00}
+    mutable_defaults = {"groups" : list, "outgoing_packets" : list}
+    verbosity = {"update_state" : "vvv"}    
+    
     def __init__(self, *args, **kwargs):
         super(Broadcast_Node_Simulator, self).__init__(*args, **kwargs)
         self.name = self.name or id(self)       
@@ -105,11 +110,8 @@ class Broadcast_Node_Simulator(pride.components.base.Base):
                 self._broadcast(packet)
             del self.outgoing_packets[:]
             
-    def create_packet(self, data):
-        assert not isinstance(data, Packet)
-        self._counter = (self._counter + 1) % self._counter_size
-        packet_kwargs = dict((key, getattr(self, attribute_name)) for key, attribute_name in self.packet_fields.items())        
-        packet_kwargs["data"] = data        
+    def create_packet(self, **packet_kwargs):
+        assert not isinstance(data, Packet)                        
         return self.packet_type(**packet_kwargs)  
         
     def broadcast(self, packet):
@@ -188,50 +190,138 @@ class Node_Group(pride.components.base.Base):
 #                 -> temporary data caching (push/upload) # some data has a limited lifespan
 #                 -> data retrieval     (pull/download) # for downloading
 
+# "connectivity" layer/protocol:    ttl || packet_id || data
+#   - makes data available to network
+# "data transfer" layer/protocol:   type0 || hash(public_key) || encrypt(data, public_key)
+#   - sends data to specified recipient
+#   ! needs a name resolution service
+#       - a place that stores name:public_key pairs
+#       - network storage with hash(data):data is unforgeable
+# data storage layer/protocol:      type1 || key:hash(data) || value:data
+#   - stores data in network for some lifetime
+# max packet size: 2304 bytes;    256 bytes of header + 2048 bytes of data
+# max packet size: 1500 bytes;    256 bytes of header + 1244 bytes of data
 
-# ttl 
+# connectivity header
+# packet_id:   32
+# time_to_live: 1
+
+# transfer header: 1
+# hash(public key): 32
+
+
+
+
 
 class Protocol_Packet(Packet):
     
-    header = ("time_to_live", "data", "packet_id")
+    header = ("time_to_live", "packet_id", "data")
+    
+            
+class Name_Resolution_Request(Protocol_Packet): 
+
+    header = ("time_to_live", "packet_id", "request_type", "data")
+    
+     
+class Name_Resolution_Response(Protocol_Packet):
+
+    header = header = ("time_to_live", "packet_id", "response_identifier", "data") 
     
     
 class Protocol_Simulator(Broadcast_Node_Simulator):
       
-    ROUTING_METHOD = {"specific recipient" : 0x00, "broadcast" : 0x01,
-                      "multicast" : 0x01}
     packet_type = Protocol_Packet
-    packet_fields = {"time_to_live" : "time_to_live"}
-    
-    defaults = {"time_to_live" : 255}       
-    mutable_defaults = {"recently_sent_packets" : list}
+    name_resolution_request_type = Name_Resolution_Request
+    defaults = {"default_time_to_live" : 255, "nrs_public_key" : None, "public_key" : None}       
+    mutable_defaults = {"recently_sent_packets" : lambda: collections.deque(maxlen=255),
+                        "response_identifiers" : list}
     
     def __init__(self, *args, **kwargs):
         super(Protocol_Simulator, self).__init__(*args, **kwargs)
-        packet_data = "Announce: {}".format(self.reference)
-        packet_id = self.create_packet_id(packet_data)
-        self.outgoing_packets.append(Protocol_Packet(time_to_live=self.time_to_live, 
-                                                     data=packet_data,
-                                                     packet_id=packet_id))
+        #requester_public_key, receiever_id, host_names
+        #receiver_id = self.create_packet_id()
+        #self.response_identifiers.append(receiver_id)
+        #request = (None, receiver_id, ("Service0", "Service1"))
+        #packet_data = self.save_data(request)
+        #print packet_data
+        #assert self.load_data(packet_data) == request
+        #packet_id = self.create_packet_id()
+        #self.outgoing_packets.append(Name_Resolution_Request(time_to_live=self.time_to_live, 
+        #                                                     data=packet_data,
+        #                                                     packet_id=packet_id))
+        self.resolve_name(self.nrs_public_key, ("Service0", "Service1"))
         
-    def broadcast(self, packet):
-        #print "Broadcasting: ", packet.packet_id, self.recently_sent_packets
-        #raw_input('')
+    def broadcast(self, packet):                
         if packet.packet_id not in self.recently_sent_packets:
             self.outgoing_packets.append(packet)
             self.recently_sent_packets.append(packet.packet_id)
-      #      self.sent_packets_ttl[packet.packet_id] = packet.time_to_live
-      #  else:
-      #      self.
-    def create_packet(self, data):
-        assert not isinstance(data, Packet)        
-        packet_kwargs = dict((key, getattr(self, attribute_name)) for key, attribute_name in self.packet_fields.items())        
-        packet_kwargs["data"] = data        
-        packet_kwargs["packet_id"] = self.create_packet_id(data)
-        return self.packet_type(**packet_kwargs)  
+
+    def create_packet(self, packet_type, **packet_kwargs):
+        assert not isinstance(packet_kwargs["data"], Packet)               
+        packet_kwargs.setdefault("time_to_live", self.default_time_to_live)
+        packet_kwargs.setdefault("packet_id", self.create_packet_id())
+        return packet_type(**packet_kwargs)  
         
-    def create_packet_id(self, data):
-        return hash(data) 
+    def create_packet_id(self, _size=(2 ** 257) - 1):
+        return random.randint(0, _size)
+                   
+    def resolve_name(self, nrs_public_key, host_names):
+        response_identifier = self.create_packet_id()
+        self.response_identifiers.append(response_identifier)        
+        request = self.save_data((self.public_key, response_identifier, host_names))
+        packet = self.create_packet(self.name_resolution_request_type, 
+                                    data=self.encrypt(request, nrs_public_key),
+                                    request_type=NAME_RESOLUTION_REQUEST)
+        self.broadcast(packet)        
+                
+    def handle_received_packet(self, packet):          
+        if hasattr(packet, "response_identifier"):
+           # self.alert("Obtained NRS response packet; determining recipient...")
+            if packet.response_identifier in self.response_identifiers:
+                self.handle_name_resolution_response(packet)
+                
+    def handle_name_resolution_response(self, packet):
+        super(Protocol_Simulator, self).handle_received_packet(packet)        
+        self.response_identifiers.remove(packet.response_identifier)
+        resolved_names = self.load_data(self.decrypt(packet.data))
+        for name, public_key in resolved_names:            
+            NAME_RESOLVER[name] = public_key            
+        
+    def save_data(self, data):
+        return persistence.save_data(data)
+        
+    def load_data(self, data):
+        return persistence.load_data(data)
+        
+    def decrypt(self, data):
+        #cryptoprovider.asymmetric.encrypt(data, self.public_key)
+      #  self.alert("Encryption not enabled, returning plaintext packet data", level=0)
+        return data
+        #raise NotImplementedError()
+    
+    def encrypt(self, data, public_key):
+     #   self.alert("Encryption not enabled, returning plaintext packet data", level=0)
+        return data
+        
+# serialize -> encrypt
+# decrypt -> deserialize
+
+class Name_Resolution_Service(Protocol_Simulator):
+        
+    packet_type = Name_Resolution_Response
+    mutable_defaults = {"host_names" : lambda: {"Service0" : "Service0-PublicKey", "Service1" : "Service1-PublicKey"}}
+    
+    def handle_received_packet(self, packet):
+        if getattr(packet, "request_type", None) == NAME_RESOLUTION_REQUEST:            
+            data = self.decrypt(packet.data) # the ability to decrypt proves the authenticity of the response
+            requester_public_key, receiver_id, host_names = self.load_data(data)
+            #host_names = self.load_data(packet.data)
+            resolved_hosts = tuple((host_name, self.host_lookup(host_name)) for host_name in host_names)        
+            response = self.encrypt(self.save_data(resolved_hosts), requester_public_key)
+            self.broadcast(self.create_packet(self.packet_type, data=response, response_identifier=receiver_id))
+        
+    def host_lookup(self, host_name):
+        return self.host_names[host_name]
         
 if __name__ == "__main__":
     Broadcast_Network_Simulator.unit_test()
