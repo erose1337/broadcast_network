@@ -24,6 +24,8 @@ NAME_RESOLVER = dict()
 
 ROOT_NAME_RESOLUTION_PUBLIC_KEY = hash(0xc0ffee)
 
+MAX_PACKET_ID_SIZE = (2 ** 257) - 1
+
 def get_nodes_from_groups(groups):
     nodes = []
     for group in groups:
@@ -51,21 +53,24 @@ class Broadcast_Network_Simulator(pride.components.scheduler.Process):
         
     @classmethod
     def unit_test(cls):           
-        node_types = [Protocol_Simulator]
+        node_types = [Connectivity_Layer]
         group_types = [Node_Group]
-        network_size = 3
+        network_size = 5
         simulator = cls.generate_random_network(node_types, group_types, network_size)          
-        connecting_node = Protocol_Simulator(latency=.005, name="router")                
-        name_resolution_node = Protocol_Simulator(name="Name Resolution Service", public_key=ROOT_NAME_RESOLUTION_PUBLIC_KEY)
+        connecting_node = Connectivity_Layer(latency=.005, name="router")                
+        name_resolution_node = Name_Resolution_Node(name="Name Resolution Service", public_key=ROOT_NAME_RESOLUTION_PUBLIC_KEY)
+        name_request_node = Name_Resolution_Node(name="Name Resolution Requester")
         #simulator.groups[0].add(connecting_node)        
-                        
+        
         for group in simulator.groups:
-            for node in group.nodes:
-                node.resolve_name(node.nrs_public_key, ("Service0", "Service1"))                                      
+            #for node in group.nodes:
+            #    node.resolve_name(node.nrs_public_key, ("Service0", "Service1"))                                      
             group.add(connecting_node)
         #simulator.groups[1].add(connecting_node)        
         #simulator.groups[2].add(connecting_node)        
-        simulator.groups[-1].add(name_resolution_node)        
+        simulator.groups[-1].add(name_resolution_node) 
+        simulator.groups[0].add(name_request_node)
+        name_request_node.resolve_name(name_request_node.nrs_public_key, ("Service0", "Service1"))        
         print "Name of routing node: {}".format(connecting_node)
         print "Name of NRS node    : {}".format(name_resolution_node)
         print "Complete network: {}".format([[node.reference for node in group.nodes] for group in simulator.groups])
@@ -93,7 +98,16 @@ class Packet(object):
         attributes = dict((field_name, getattr(self, field_name)) for field_name in self.header)
         return type(self)(**attributes)
         
+class Protocol_Packet(Packet):
+    
+    header = ("time_to_live", "packet_id", "recipient_id", "data")
+    
+            
+class Name_Resolution_Request(Protocol_Packet): pass
+            
+class Name_Resolution_Response(Protocol_Packet): pass
 
+        
 class Node_Group(pride.components.base.Base):
                 
     mutable_defaults = {"nodes" : list}
@@ -130,16 +144,17 @@ class Node_Group(pride.components.base.Base):
         super(Node_Group, self).delete()
 
         
-class Broadcast_Node_Simulator(pride.components.base.Base):      
+class Node_Simulator(pride.components.base.Base):      
         
     latency_categories = {"fast" : .025, "normal" : .1, "slow" : .75}
-    defaults = {"simulation_time" : 0.00, "latency" : 0.100}
+    defaults = {"simulation_time" : 0.00, "latency" : 0.100,
+                "min_packet_loss" : 0, "max_packet_loss" : 100, "packet_loss_threshold" : 50}
     flags = {"name" : None, "_next_send_time" : 0.00}
     mutable_defaults = {"groups" : list, "outgoing_packets" : list}
     verbosity = {"update_state" : "vvv"}    
     
     def __init__(self, *args, **kwargs):
-        super(Broadcast_Node_Simulator, self).__init__(*args, **kwargs)
+        super(Node_Simulator, self).__init__(*args, **kwargs)
         self.name = self.name or id(self)       
         
     def update_state(self, simulation_time):
@@ -156,29 +171,23 @@ class Broadcast_Node_Simulator(pride.components.base.Base):
         assert not isinstance(data, Packet)                        
         return packet_type(**packet_kwargs)  
         
-    def broadcast(self, packet):
+    def broadcast(self, packet):     
         assert isinstance(packet, Packet)
-        self.outgoing_packets.append(packet)                
-        
+        if packet.packet_id not in self.recently_sent_packets:
+            self.outgoing_packets.append(packet)
+            self.recently_sent_packets.append(packet.packet_id)
+            
     def _broadcast(self, packet):      
         assert isinstance(packet, Packet)
         for node in get_nodes_from_groups(self.groups):
             if node is not self:
                 #self.alert("Sending {} to: {}".format(hash(packet), node), display_name=self.reference, level=0)#self.verbosity["update_state"])                        
-                node.receive_packet(packet.copy())                  
-        
+                if random.randint(self.min_packet_loss, self.max_packet_loss) > self.packet_loss_threshold:                
+                    node.receive_packet(packet.copy())                  
+                              
     def receive_packet(self, packet):                
-        packet.time_to_live -= 1
-        assert packet.time_to_live >= 0        
-        if packet.time_to_live > 0:
-            self.broadcast(packet)
-        #self.alert("Checking packet {} {}".format(packet.recipient_id, self.response_identifiers))               
-        if packet.recipient_id in self.response_identifiers:
-            self.response_identifiers.remove(packet.recipient_id)
-            self.handle_received_packet(packet)                     
-        elif packet.recipient_id == self.hash_public_key(self.public_key):
-            self.handle_received_packet(packet)
-            
+        raise NotImplementedError()
+                    
     def handle_received_packet(self, packet):
         self.alert("received: {}".format(packet))    
         
@@ -187,7 +196,39 @@ class Broadcast_Node_Simulator(pride.components.base.Base):
         kwargs.setdefault("latency", cls.latency_categories[random.choice(cls.latency_categories.keys())])
         node = cls(**kwargs)
         return node       
-                            
+                  
+
+class Connectivity_Layer(Node_Simulator):
+
+    defaults = {"default_time_to_live" : 255, "max_packet_id" : MAX_PACKET_ID_SIZE,
+                "public_key" : None, "private_key" : None}
+    mutable_defaults = {"recently_sent_packets" : lambda: collections.deque(maxlen=65536),
+                        "response_identifiers" : list, "already_handled_packets" : lambda: collections.deque(maxlen=65536)}
+    
+    def create_packet(self, packet_type, **packet_kwargs):
+        assert not isinstance(packet_kwargs["data"], Packet)               
+        packet_kwargs.setdefault("time_to_live", self.default_time_to_live)
+        packet_kwargs.setdefault("packet_id", random.randint(0, self.max_packet_id))
+        return packet_type(**packet_kwargs) 
+        
+    def receive_packet(self, packet):
+        packet.time_to_live -= 1
+        assert packet.time_to_live >= 0        
+        if packet.time_to_live > 0:
+            self.broadcast(packet)
+        #self.alert("Checking packet {} {}".format(packet.recipient_id, self.response_identifiers))               
+        if packet.packet_id not in self.already_handled_packets:
+            if packet.recipient_id in self.response_identifiers:
+                self.response_identifiers.remove(packet.recipient_id)
+                self.handle_received_packet(packet)                     
+            elif packet.recipient_id == self.hash_public_key(self.public_key): # change to constant time comparison
+                self.handle_received_packet(packet)        
+            self.already_handled_packets.append(packet.packet_id)
+        
+    def hash_public_key(self, public_key):
+        #self.alert("cryptography not installed, using insecure hash", level=0)
+        return hash(public_key)
+        
 # message delivery options -> specific recipient        
 #                          -> broadcast (all receivers)
 #                          -> multicast (like broadcasting to individual groups)
@@ -218,62 +259,36 @@ class Broadcast_Node_Simulator(pride.components.base.Base):
 
 # transfer header: 1
 # hash(public key): 32
-
-
-
-
-
-class Protocol_Packet(Packet):
-    
-    header = ("time_to_live", "packet_id", "recipient_id", "data")
-    
-            
-class Name_Resolution_Request(Protocol_Packet): pass
-            
-class Name_Resolution_Response(Protocol_Packet): pass
        
-    
-class Protocol_Simulator(Broadcast_Node_Simulator):
-          
-    name_resolution_request_type = Name_Resolution_Request
-    defaults = {"default_time_to_live" : 255, "nrs_public_key" : ROOT_NAME_RESOLUTION_PUBLIC_KEY, "public_key" : None}       
-    mutable_defaults = {"recently_sent_packets" : lambda: collections.deque(maxlen=65536),
-                        "response_identifiers" : list,
-                        "host_names" : lambda: {"Service0" : "Service0-PublicKey", 
-                                                "Service1" : "Service1-PublicKey"}}
-            
-    def broadcast(self, packet):                
-        if packet.packet_id not in self.recently_sent_packets:
-            self.outgoing_packets.append(packet)
-            self.recently_sent_packets.append(packet.packet_id)
-
-    def create_packet(self, packet_type, **packet_kwargs):
-        assert not isinstance(packet_kwargs["data"], Packet)               
-        packet_kwargs.setdefault("time_to_live", self.default_time_to_live)
-        packet_kwargs.setdefault("packet_id", self.generate_random_number())
-        return packet_type(**packet_kwargs)  
-        
-    def generate_random_number(self, _size=(2 ** 257) - 1):
-        return random.randint(0, _size)
+       
+class Name_Resolution_Node(Connectivity_Layer):
+              
+    defaults = {"nrs_public_key" : ROOT_NAME_RESOLUTION_PUBLIC_KEY, "timeout_interval" : 2}       
+    mutable_defaults = {"host_names" : lambda: {"Service0" : "Service0-PublicKey", 
+                                                "Service1" : "Service1-PublicKey"}}                              
                    
     def resolve_name(self, nrs_public_key, host_names):
         self.alert("Issuing name resolution request")
-        return_address = self.generate_random_number()                
+        return_address = random.randint(0, MAX_PACKET_ID_SIZE)
         request = (NAME_RESOLUTION_REQUEST, (self.public_key, return_address, host_names))
         packaged_data = self.package(request, nrs_public_key)
         nrs_id = self.hash_public_key(nrs_public_key)
-        packet = self.create_packet(self.name_resolution_request_type, 
+        packet = self.create_packet(Name_Resolution_Request,
                                     data=packaged_data,
                                     recipient_id=nrs_id)
         self.broadcast(packet)        
-        self.response_identifiers.append(return_address)        
-        # move timeout to broadcast in parent class 
+        self.response_identifiers.append(return_address)                
         self._timeout_instruction = pride.Instruction(self.reference, "handle_timeout", packet)
-        self._timeout_instruction.execute(priority=2)
+        self._timeout_instruction.execute(priority=self.timeout_interval)
                 
     def handle_timeout(self, packet):
-        self.alert("Request {} timed out".format(hash(packet)))
-        raise SystemExit()
+        self.alert("Name Resolution Request timed out; Re-issuing".format(hash(packet)))
+        new_packet = packet.copy()
+        packet.packet_id = random.randint(0, self.max_packet_id)
+        self.broadcast(packet)
+        self._timeout_instruction = pride.Instruction(self.reference, "handle_timeout", packet)
+        self._timeout_instruction.execute(priority=self.timeout_interval)
+        #raise SystemExit()
         
     def handle_received_packet(self, packet):                                  
         # decrypt packet data to learn the request type and what to do with the data
@@ -285,9 +300,9 @@ class Protocol_Simulator(Broadcast_Node_Simulator):
             self.handle_name_resolution_request(packet)
         else:
             self.alert("Received unknown packet type: {}".format(request_type), level=0)
-            
+                
     def handle_name_resolution_response(self, packet):
-        super(Protocol_Simulator, self).handle_received_packet(packet)                
+        super(Name_Resolution_Node, self).handle_received_packet(packet)                
         request_type, resolved_names = self.unpackage(packet.data)
         for name, public_key in resolved_names:            
             NAME_RESOLVER[name] = public_key            
@@ -313,11 +328,7 @@ class Protocol_Simulator(Broadcast_Node_Simulator):
     def encrypt(self, data, public_key):
      #   self.alert("Encryption not enabled, returning plaintext packet data", level=0)
         return data
-        
-    def hash_public_key(self, public_key):
-        #self.alert("cryptography not installed, using insecure hash", level=0)
-        return hash(public_key)
-    
+            
     def handle_name_resolution_request(self, packet):
         self.alert("Handling Name Resolution Request")
         request_type, request_data = self.unpackage(packet.data) # the ability to decrypt proves the authenticity of the response

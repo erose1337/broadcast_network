@@ -1,0 +1,5 @@
+todo
+-----
+add ability to packetize large datagrams into a sequence of smaller datagrams
+Add encryption/decryption
+add "connect" method for initiating secure connection to a node
