@@ -25,6 +25,8 @@ NAME_RESOLVER = dict()
 ROOT_NAME_RESOLUTION_PUBLIC_KEY = hash(0xc0ffee)
 
 MAX_PACKET_ID_SIZE = (2 ** 257) - 1
+MAX_SEQUENCE_SIZE = (2 ** 32) - 1
+MAX_DATA_SIZE = 2048
 
 def get_nodes_from_groups(groups):
     nodes = []
@@ -79,10 +81,21 @@ class Broadcast_Network_Simulator(pride.components.scheduler.Process):
     
 class Packet(object):
         
-    header = ("sender_id", "timestamp", "message_counter", "time_to_live", "data")
+    header = ("sender_id", "timestamp", "message_counter", "time_to_live", "data")    
+        
+    def _get_data(self):
+        return self._data
+    def _set_data(self, value):
+        if len(value) > self.max_data_size:
+            raise ValueError("Data too large to fit into packet")
+        else:
+            self._data = value
+    data = property(_get_data, _set_data)
     
     def __init__(self, **kwargs):
         super(Packet, self).__init__()
+        self._data = ''
+        self.max_data_size = MAX_DATA_SIZE
         for field_name in self.header:
             try:
                 value = kwargs.pop(field_name)
@@ -229,6 +242,69 @@ class Connectivity_Layer(Node_Simulator):
         #self.alert("cryptography not installed, using insecure hash", level=0)
         return hash(public_key)
         
+        
+class Reliable_Packet(Protocol_Packet):
+            
+    header = ("time_to_live", "packet_id", "recipient_id", "packet_number", "packet_total", "datagram_number", "data")
+    
+    
+class Reliable_Connectivity_Layer(Connectivity_Layer):    
+    # delivers reliable, ordered datagrams 
+    defaults = {"default_sequence_number" : 0, "max_sequence_size" : MAX_SEQUENCE_SIZE,
+                "packet_number" : 0, "datagram_number" : 0}
+    mutable_defaults = {"outgoing_datagrams" : dict}
+    
+    def send_to(self, data, receiver):
+        max_data_size = Reliable_Packet.max_data_size
+        number_of_packets, extra = divmod(data, max_data_size)
+        if extra:
+            number_of_packets += 1
+        
+        series = []        
+        
+        datagram_number = self.datagram_number
+        for packet_number in range(number_of_packets):                
+            packet = self.create_packet(Reliable_Packet, packet_number=packet_number,
+                                                         packet_total=number_of_packets,
+                                                         datagram_number=datagram_number,
+                                                         data=data[(packet_number * max_data_size):((packet_number + 1) * max_data_size)])
+            series.append(packet)
+            self.broadcast(packet)
+        self.outgoing_datagrams[packet_id] = series          
+    
+    def handle_received_packet(self, packet):
+        try:
+            datagram_pieces = self.incoming_requests[packet.packet_id]
+        except KeyError:
+            datagram_pieces = self.incoming_requests[packet.packet_id] = set((packet, ))
+        else:                        
+            datagram_pieces.add(packet)
+        
+        if packet.packet_total == len(datagram_pieces): # all pieces obtained, re-assemble            
+            data = ''.join((item.data for item in sorted(datagram_pieces, key=operator.attrgetter("packet_number"))))
+            del self.incoming_requests[packet.packet_id]                        
+            self.receive_from(data, packet.recipient_id)
+        else:
+            try:
+                nack_instruction = self.nack_timer[packet.packet_id]
+            except KeyError:
+                nack_instruction = pride.Instruction(self.reference, "nack", packet.packet_id)
+                self.nack_timer[packet.packet_id] = nack_instruction
+            else:
+                nack_instruction.unschedule()
+            nack_instruction.execute(priority=self.nack_delay)
+            
+    def nack(self, packet):
+        datagram_pieces = set((_packet.packet_number for _packet in self.incoming_requests[packet.packet_id]))
+        all_pieces = set(range(packet.packet_total))
+        nack_numbers = all_pieces.difference(datagram_pieces)
+        nack_request = self.create_packet(Nack_Packet, 
+        
+        
+    def receive_from(self, data, return_address):
+        self.alert("Received {} from {}".format(data, return_address)
+        
+        
 # message delivery options -> specific recipient        
 #                          -> broadcast (all receivers)
 #                          -> multicast (like broadcasting to individual groups)
@@ -241,10 +317,10 @@ class Connectivity_Layer(Node_Simulator):
 #                 -> temporary data caching (push/upload) # some data has a limited lifespan
 #                 -> data retrieval     (pull/download) # for downloading
 
-# "connectivity" layer/protocol:    ttl || packet_id || data
+# "connectivity" layer/protocol:    ttl || packet_id || recipient_id || data
 #   - makes data available to network
-# "data transfer" layer/protocol:   type0 || hash(public_key) || encrypt(data, public_key)
-#   - sends data to specified recipient
+# "data transfer" layer/protocol:   ttl || recipient_id || packet_id || sequence_number || datagram_number
+#   - sends ordered, reliable datagrams to specified recipient
 #   ! needs a name resolution service
 #       - a place that stores name:public_key pairs
 #       - network storage with hash(data):data is unforgeable
